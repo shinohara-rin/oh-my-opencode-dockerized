@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.github
+.opencode
+.DS_Store
+coverage
+docs
+*.log
