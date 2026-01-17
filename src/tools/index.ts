@@ -1,16 +1,14 @@
 import {
-  lsp_hover,
   lsp_goto_definition,
   lsp_find_references,
-  lsp_document_symbols,
-  lsp_workspace_symbols,
+  lsp_symbols,
   lsp_diagnostics,
-  lsp_servers,
   lsp_prepare_rename,
   lsp_rename,
-  lsp_code_actions,
-  lsp_code_action_resolve,
+  lspManager,
 } from "./lsp"
+
+export { lspManager }
 
 import {
   ast_grep_search,
@@ -36,7 +34,6 @@ export { getTmuxPath } from "./interactive-bash/utils"
 export { createSkillMcpTool } from "./skill-mcp"
 
 import {
-  createBackgroundTask,
   createBackgroundOutput,
   createBackgroundCancel,
 } from "./background-task"
@@ -48,27 +45,22 @@ type OpencodeClient = PluginInput["client"]
 
 export { createCallOmoAgent } from "./call-omo-agent"
 export { createLookAt } from "./look-at"
+export { createDelegateTask, type DelegateTaskToolOptions, DEFAULT_CATEGORIES, CATEGORY_PROMPT_APPENDS } from "./delegate-task"
 
 export function createBackgroundTools(manager: BackgroundManager, client: OpencodeClient): Record<string, ToolDefinition> {
   return {
-    background_task: createBackgroundTask(manager),
     background_output: createBackgroundOutput(manager, client),
     background_cancel: createBackgroundCancel(manager, client),
   }
 }
 
 export const builtinTools: Record<string, ToolDefinition> = {
-  lsp_hover,
   lsp_goto_definition,
   lsp_find_references,
-  lsp_document_symbols,
-  lsp_workspace_symbols,
+  lsp_symbols,
   lsp_diagnostics,
-  lsp_servers,
   lsp_prepare_rename,
   lsp_rename,
-  lsp_code_actions,
-  lsp_code_action_resolve,
   ast_grep_search,
   ast_grep_replace,
   grep,

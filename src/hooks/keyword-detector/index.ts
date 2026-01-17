@@ -1,13 +1,15 @@
 import type { PluginInput } from "@opencode-ai/plugin"
 import { detectKeywordsWithType, extractPromptText, removeCodeBlocks } from "./detector"
 import { log } from "../../shared"
-import { getMainSessionID } from "../../features/claude-code-session-state"
+import { isSystemDirective } from "../../shared/system-directive"
+import { getMainSessionID, getSessionAgent, subagentSessions } from "../../features/claude-code-session-state"
+import type { ContextCollector } from "../../features/context-injector"
 
 export * from "./detector"
 export * from "./constants"
 export * from "./types"
 
-export function createKeywordDetectorHook(ctx: PluginInput) {
+export function createKeywordDetectorHook(ctx: PluginInput, collector?: ContextCollector) {
   return {
     "chat.message": async (
       input: {
@@ -22,14 +24,26 @@ export function createKeywordDetectorHook(ctx: PluginInput) {
       }
     ): Promise<void> => {
       const promptText = extractPromptText(output.parts)
-      let detectedKeywords = detectKeywordsWithType(removeCodeBlocks(promptText), input.agent)
+
+      if (isSystemDirective(promptText)) {
+        log(`[keyword-detector] Skipping system directive message`, { sessionID: input.sessionID })
+        return
+      }
+
+      const currentAgent = getSessionAgent(input.sessionID) ?? input.agent
+      let detectedKeywords = detectKeywordsWithType(removeCodeBlocks(promptText), currentAgent)
 
       if (detectedKeywords.length === 0) {
         return
       }
 
-      // Only ultrawork keywords work in non-main sessions
-      // Other keywords (search, analyze, etc.) only work in main sessions
+      // Skip keyword detection for background task sessions to prevent mode injection
+      // (e.g., [analyze-mode]) which incorrectly triggers Prometheus restrictions
+      const isBackgroundTaskSession = subagentSessions.has(input.sessionID)
+      if (isBackgroundTaskSession) {
+        return
+      }
+
       const mainSessionID = getMainSessionID()
       const isNonMainSession = mainSessionID && input.sessionID !== mainSessionID
 
@@ -48,7 +62,9 @@ export function createKeywordDetectorHook(ctx: PluginInput) {
       if (hasUltrawork) {
         log(`[keyword-detector] Ultrawork mode activated`, { sessionID: input.sessionID })
 
-        output.message.variant = "max"
+        if (output.message.variant === undefined) {
+          output.message.variant = "max"
+        }
 
         ctx.client.tui
           .showToast({
@@ -62,6 +78,17 @@ export function createKeywordDetectorHook(ctx: PluginInput) {
           .catch((err) =>
             log(`[keyword-detector] Failed to show toast`, { error: err, sessionID: input.sessionID })
           )
+      }
+
+      if (collector) {
+        for (const keyword of detectedKeywords) {
+          collector.register(input.sessionID, {
+            id: `keyword-${keyword.type}`,
+            source: "keyword-detector",
+            content: keyword.message,
+            priority: keyword.type === "ultrawork" ? "critical" : "high",
+          })
+        }
       }
 
       log(`[keyword-detector] Detected ${detectedKeywords.length} keywords`, {

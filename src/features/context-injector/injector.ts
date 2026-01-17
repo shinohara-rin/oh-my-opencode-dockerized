@@ -1,6 +1,7 @@
 import type { ContextCollector } from "./collector"
 import type { Message, Part } from "@opencode-ai/sdk"
 import { log } from "../../shared"
+import { getMainSessionID } from "../claude-code-session-state"
 
 interface OutputPart {
   type: string
@@ -52,10 +53,16 @@ interface ChatMessageOutput {
 export function createContextInjectorHook(collector: ContextCollector) {
   return {
     "chat.message": async (
-      _input: ChatMessageInput,
-      _output: ChatMessageOutput
+      input: ChatMessageInput,
+      output: ChatMessageOutput
     ): Promise<void> => {
-      void collector
+      const result = injectPendingContext(collector, input.sessionID, output.parts)
+      if (result.injected) {
+        log("[context-injector] Injected pending context via chat.message", {
+          sessionID: input.sessionID,
+          contextLength: result.contextLength,
+        })
+      }
     },
   }
 }
@@ -78,6 +85,9 @@ export function createContextInjectorMessagesTransformHook(
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
       const { messages } = output
+      log("[DEBUG] experimental.chat.messages.transform called", {
+        messageCount: messages.length,
+      })
       if (messages.length === 0) {
         return
       }
@@ -91,16 +101,31 @@ export function createContextInjectorMessagesTransformHook(
       }
 
       if (lastUserMessageIndex === -1) {
+        log("[DEBUG] No user message found in messages")
         return
       }
 
       const lastUserMessage = messages[lastUserMessageIndex]
-      const sessionID = (lastUserMessage.info as unknown as { sessionID?: string }).sessionID
+      // Try message.info.sessionID first, fallback to mainSessionID
+      const messageSessionID = (lastUserMessage.info as unknown as { sessionID?: string }).sessionID
+      const sessionID = messageSessionID ?? getMainSessionID()
+      log("[DEBUG] Extracted sessionID", {
+        messageSessionID,
+        mainSessionID: getMainSessionID(),
+        sessionID,
+        infoKeys: Object.keys(lastUserMessage.info),
+      })
       if (!sessionID) {
+        log("[DEBUG] sessionID is undefined (both message.info and mainSessionID are empty)")
         return
       }
 
-      if (!collector.hasPending(sessionID)) {
+      const hasPending = collector.hasPending(sessionID)
+      log("[DEBUG] Checking hasPending", {
+        sessionID,
+        hasPending,
+      })
+      if (!hasPending) {
         return
       }
 
@@ -109,47 +134,33 @@ export function createContextInjectorMessagesTransformHook(
         return
       }
 
-      const refInfo = lastUserMessage.info as unknown as {
-        sessionID?: string
-        agent?: string
-        model?: { providerID?: string; modelID?: string }
-        path?: { cwd?: string; root?: string }
+      const textPartIndex = lastUserMessage.parts.findIndex(
+        (p) => p.type === "text" && (p as { text?: string }).text
+      )
+
+      if (textPartIndex === -1) {
+        log("[context-injector] No text part found in last user message, skipping injection", {
+          sessionID,
+          partsCount: lastUserMessage.parts.length,
+        })
+        return
       }
 
-      const syntheticMessageId = `synthetic_ctx_${Date.now()}`
-      const syntheticPartId = `synthetic_ctx_part_${Date.now()}`
-      const now = Date.now()
-
-      const syntheticMessage: MessageWithParts = {
-        info: {
-          id: syntheticMessageId,
-          sessionID: sessionID,
-          role: "user",
-          time: { created: now },
-          agent: refInfo.agent ?? "Sisyphus",
-          model: refInfo.model ?? { providerID: "unknown", modelID: "unknown" },
-          path: refInfo.path ?? { cwd: "/", root: "/" },
-        } as unknown as Message,
-        parts: [
-          {
-            id: syntheticPartId,
-            sessionID: sessionID,
-            messageID: syntheticMessageId,
-            type: "text",
-            text: pending.merged,
-            synthetic: true,
-            time: { start: now, end: now },
-          } as Part,
-        ],
+      // synthetic part 패턴 (minimal fields)
+      const syntheticPart = {
+        id: `synthetic_hook_${Date.now()}`,
+        messageID: lastUserMessage.info.id,
+        sessionID: (lastUserMessage.info as { sessionID?: string }).sessionID ?? "",
+        type: "text" as const,
+        text: pending.merged,
+        synthetic: true,  // UI에서 숨겨짐
       }
 
-      messages.splice(lastUserMessageIndex, 0, syntheticMessage)
+      lastUserMessage.parts.splice(textPartIndex, 0, syntheticPart as Part)
 
-      log("[context-injector] Injected synthetic message from collector", {
+      log("[context-injector] Inserted synthetic part with hook content", {
         sessionID,
-        insertIndex: lastUserMessageIndex,
-        contextLength: pending.merged.length,
-        newMessageCount: messages.length,
+        contentLength: pending.merged.length,
       })
     },
   }

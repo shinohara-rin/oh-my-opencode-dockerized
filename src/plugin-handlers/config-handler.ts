@@ -1,4 +1,5 @@
 import { createBuiltinAgents } from "../agents";
+import { createSisyphusJuniorAgentWithOverrides } from "../agents/sisyphus-junior";
 import {
   loadUserCommands,
   loadProjectCommands,
@@ -22,13 +23,22 @@ import { createBuiltinMcps } from "../mcp";
 import type { OhMyOpenCodeConfig } from "../config";
 import { log } from "../shared";
 import { migrateAgentConfig } from "../shared/permission-compat";
-import { PLAN_SYSTEM_PROMPT, PLAN_PERMISSION } from "../agents/plan-prompt";
+import { PROMETHEUS_SYSTEM_PROMPT, PROMETHEUS_PERMISSION } from "../agents/prometheus-prompt";
+import { DEFAULT_CATEGORIES } from "../tools/delegate-task/constants";
 import type { ModelCacheState } from "../plugin-state";
+import type { CategoryConfig } from "../config/schema";
 
 export interface ConfigHandlerDeps {
   ctx: { directory: string };
   pluginConfig: OhMyOpenCodeConfig;
   modelCacheState: ModelCacheState;
+}
+
+export function resolveCategoryConfig(
+  categoryName: string,
+  userCategories?: Record<string, CategoryConfig>
+): CategoryConfig | undefined {
+  return userCategories?.[categoryName] ?? DEFAULT_CATEGORIES[categoryName];
 }
 
 export function createConfigHandler(deps: ConfigHandlerDeps) {
@@ -93,7 +103,9 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
       pluginConfig.disabled_agents,
       pluginConfig.agents,
       ctx.directory,
-      config.model as string | undefined
+      config.model as string | undefined,
+      pluginConfig.categories,
+      pluginConfig.git_master
     );
 
     // Claude Code agents: Do NOT apply permission migration
@@ -131,6 +143,8 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
       explore?: { tools?: Record<string, unknown> };
       librarian?: { tools?: Record<string, unknown> };
       "multimodal-looker"?: { tools?: Record<string, unknown> };
+      "orchestrator-sisyphus"?: { tools?: Record<string, unknown> };
+      Sisyphus?: { tools?: Record<string, unknown> };
     };
     const configAgent = config.agent as AgentConfig | undefined;
 
@@ -140,6 +154,11 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
       const agentConfig: Record<string, unknown> = {
         Sisyphus: builtinAgents.Sisyphus,
       };
+
+      agentConfig["Sisyphus-Junior"] = createSisyphusJuniorAgentWithOverrides(
+        pluginConfig.agents?.["Sisyphus-Junior"],
+        config.model as string | undefined
+      );
 
       if (builderEnabled) {
         const { name: _buildName, ...buildConfigWithoutName } =
@@ -165,21 +184,56 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
         const migratedPlanConfig = migrateAgentConfig(
           planConfigWithoutName as Record<string, unknown>
         );
-        const plannerSisyphusOverride =
-          pluginConfig.agents?.["Planner-Sisyphus"];
+        const prometheusOverride =
+          pluginConfig.agents?.["Prometheus (Planner)"] as
+            | (Record<string, unknown> & { category?: string; model?: string })
+            | undefined;
         const defaultModel = config.model as string | undefined;
-        const plannerSisyphusBase = {
-          model: (migratedPlanConfig as Record<string, unknown>).model ?? defaultModel,
+
+        // Resolve full category config (model, temperature, top_p, tools, etc.)
+        // Apply all category properties when category is specified, but explicit
+        // overrides (model, temperature, etc.) will take precedence during merge
+        const categoryConfig = prometheusOverride?.category
+          ? resolveCategoryConfig(
+              prometheusOverride.category,
+              pluginConfig.categories
+            )
+          : undefined;
+
+        const prometheusBase = {
+          model:
+            prometheusOverride?.model ??
+            categoryConfig?.model ??
+            defaultModel ??
+            "anthropic/claude-opus-4-5",
           mode: "primary" as const,
-          prompt: PLAN_SYSTEM_PROMPT,
-          permission: PLAN_PERMISSION,
-          description: `${configAgent?.plan?.description ?? "Plan agent"} (OhMyOpenCode version)`,
-          color: (configAgent?.plan?.color as string) ?? "#6495ED",
+          prompt: PROMETHEUS_SYSTEM_PROMPT,
+          permission: PROMETHEUS_PERMISSION,
+          description: `${configAgent?.plan?.description ?? "Plan agent"} (Prometheus - OhMyOpenCode)`,
+          color: (configAgent?.plan?.color as string) ?? "#FF6347",
+          // Apply category properties (temperature, top_p, tools, etc.)
+          ...(categoryConfig?.temperature !== undefined
+            ? { temperature: categoryConfig.temperature }
+            : {}),
+          ...(categoryConfig?.top_p !== undefined
+            ? { top_p: categoryConfig.top_p }
+            : {}),
+          ...(categoryConfig?.maxTokens !== undefined
+            ? { maxTokens: categoryConfig.maxTokens }
+            : {}),
+          ...(categoryConfig?.tools ? { tools: categoryConfig.tools } : {}),
+          ...(categoryConfig?.thinking ? { thinking: categoryConfig.thinking } : {}),
+          ...(categoryConfig?.reasoningEffort !== undefined
+            ? { reasoningEffort: categoryConfig.reasoningEffort }
+            : {}),
+          ...(categoryConfig?.textVerbosity !== undefined
+            ? { textVerbosity: categoryConfig.textVerbosity }
+            : {}),
         };
 
-        agentConfig["Planner-Sisyphus"] = plannerSisyphusOverride
-          ? { ...plannerSisyphusBase, ...plannerSisyphusOverride }
-          : plannerSisyphusBase;
+        agentConfig["Prometheus (Planner)"] = prometheusOverride
+          ? { ...prometheusBase, ...prometheusOverride }
+          : prometheusBase;
       }
 
     const filteredConfigAgents = configAgent
@@ -202,7 +256,7 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
         : {};
 
       const planDemoteConfig = replacePlan
-        ? { mode: "subagent" as const, hidden: true }
+        ? { mode: "subagent" as const }
         : undefined;
 
       config.agent = {
@@ -232,34 +286,43 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
     config.tools = {
       ...(config.tools as Record<string, unknown>),
       "grep_app_*": false,
+      LspHover: false,
+      LspCodeActions: false,
+      LspCodeActionResolve: false,
     };
 
-    if (agentResult.explore) {
-      agentResult.explore.tools = {
-        ...agentResult.explore.tools,
-        call_omo_agent: false,
-      };
-    }
+    type AgentWithPermission = { permission?: Record<string, unknown> };
+    
     if (agentResult.librarian) {
-      agentResult.librarian.tools = {
-        ...agentResult.librarian.tools,
-        call_omo_agent: false,
-        "grep_app_*": true,
-      };
+      const agent = agentResult.librarian as AgentWithPermission;
+      agent.permission = { ...agent.permission, "grep_app_*": "allow" };
     }
     if (agentResult["multimodal-looker"]) {
-      agentResult["multimodal-looker"].tools = {
-        ...agentResult["multimodal-looker"].tools,
-        task: false,
-        call_omo_agent: false,
-        look_at: false,
-      };
+      const agent = agentResult["multimodal-looker"] as AgentWithPermission;
+      agent.permission = { ...agent.permission, task: "deny", look_at: "deny" };
+    }
+    if (agentResult["orchestrator-sisyphus"]) {
+      const agent = agentResult["orchestrator-sisyphus"] as AgentWithPermission;
+      agent.permission = { ...agent.permission, task: "deny", call_omo_agent: "deny", delegate_task: "allow" };
+    }
+    if (agentResult.Sisyphus) {
+      const agent = agentResult.Sisyphus as AgentWithPermission;
+      agent.permission = { ...agent.permission, call_omo_agent: "deny", delegate_task: "allow" };
+    }
+    if (agentResult["Prometheus (Planner)"]) {
+      const agent = agentResult["Prometheus (Planner)"] as AgentWithPermission;
+      agent.permission = { ...agent.permission, call_omo_agent: "deny", delegate_task: "allow" };
+    }
+    if (agentResult["Sisyphus-Junior"]) {
+      const agent = agentResult["Sisyphus-Junior"] as AgentWithPermission;
+      agent.permission = { ...agent.permission, delegate_task: "allow" };
     }
 
     config.permission = {
       ...(config.permission as Record<string, unknown>),
       webfetch: "allow",
       external_directory: "allow",
+      delegate_task: "deny",
     };
 
     const mcpResult = (pluginConfig.claude_code?.mcp ?? true)
